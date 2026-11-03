@@ -144,18 +144,36 @@
     #fw-info,#fw-status {font-size:13px;line-height:1.6;overflow-wrap:anywhere}
     #fw-status:not(:empty) {background:#eef5ef;padding:8px;border-radius:6px}
     .form-error {color:#a9361b;font-size:13px;min-height:1em}
+    [hidden] {display:none!important}
+    body.signed-out {min-width:0}
+    .account-tools {display:flex;align-items:center;gap:14px}
+    .login-panel {box-sizing:border-box;width:min(420px,calc(100% - 32px));margin:clamp(52px,13vh,150px) auto 24px;padding:32px;border:1px solid var(--line);border-radius:16px;background:#fff}
+    .login-panel h1 {font-size:23px}
+    .login-panel p {font-size:14px;line-height:1.6;color:var(--muted)}
+    .login-panel label {display:block;font-size:14px;margin:22px 0 6px}
+    .login-panel input {box-sizing:border-box;width:100%;height:40px;padding:8px 10px;font:inherit;border:1px solid #aebfb5;border-radius:6px}
+    .login-panel .primary {width:100%;margin-top:14px;background:#315f49;color:white;border:0;border-radius:6px;padding:10px;cursor:pointer}
+    .login-panel .form-error {color:#a9361b;margin-bottom:0}
     .card-header h2 {white-space:normal;overflow-wrap:anywhere}
     @media(max-width:720px){.page-heading,.page-footer{align-items:flex-start;flex-wrap:wrap}.configuration{flex-wrap:wrap}.empty-slot{min-height:130px}}
   </style>
 </head>
-<body>
+<body class="signed-out">
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand"><span class="brand-mark" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="m13 3-7 10h6l-1 8 7-11h-6l1-7Z"/></svg></span>电池监测<span class="brand-divider"></span><span class="brand-subtitle">Battery Monitor</span></div>
-      <div class="snapshot" id="cloud-status"><span class="snapshot-dot" aria-hidden="true"></span><span id="cloud-message" role="status">正在读取 OneNET…</span></div>
+      <div class="account-tools"><div class="snapshot" id="cloud-status"><span class="snapshot-dot" aria-hidden="true"></span><span id="cloud-message" role="status">等待登录</span></div><button type="button" id="logout" class="dialog-close" hidden>退出登录</button></div>
     </div>
   </header>
-  <main>
+  <form id="admin-login" class="login-panel">
+    <h1>电池管理登录</h1>
+    <p>登录后可查看电池告警、控制采集板指示灯，以及上传固件进行无线升级。</p>
+    <label for="admin-password">管理口令</label>
+    <input id="admin-password" name="password" type="password" required autocomplete="current-password">
+    <button id="login-submit" type="submit" class="primary">登录</button>
+    <p id="login-error" class="form-error" role="alert"></p>
+  </form>
+  <main id="monitor" hidden>
     <div class="page-heading">
       <div><h1>电池BMS管理系统</h1><p class="description">告警：压差 &gt; 50 mV · 单节 &lt; 2.70 V · 2S 总压 &lt; 5.40 V</p></div>
       <div class="configuration"><span>在线 <b id="active-count">0</b></span><span>已添加 <b id="total-count">0</b> 台</span><button class="primary" type="button" id="add-device">＋ 添加设备</button><button type="button" id="alarm-summary" class="alarm-summary" aria-haspopup="dialog" disabled>告警 0 组</button></div>
@@ -216,6 +234,60 @@
     const isStale = (sample, now) => Number.isFinite(sample?.reportedAt) && now - sample.reportedAt > 15000;
     const limits = { cellDeltaMv: 50, cellLowMv: 2700, packLowMv: 5400 };
     const el = id => document.getElementById(id);
+    const apiOrigin = 'https://autism-armed-pessimist.ngrok-free.dev';
+    let adminSession = '';
+
+    function remoteRequest(path, token, options = {}) {
+      return window.fetch(apiOrigin + path, {
+        ...options, cache:'no-store', credentials:'omit', redirect:'error', referrerPolicy:'no-referrer',
+        headers:{...options.headers, Authorization:'Bearer ' + token, 'ngrok-skip-browser-warning':'1'}
+      });
+    }
+
+    async function apiFetch(path, options) {
+      if (!adminSession) throw Error('请先登录。');
+      const response = await remoteRequest(path, adminSession, options);
+      if (response.status === 401) {
+        adminSession = '';
+        window.location.reload();
+        throw Error('登录已过期，请重新登录。');
+      }
+      return response;
+    }
+
+    el('admin-login').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (el('login-submit').disabled) return;
+      el('login-submit').disabled = true;
+      el('login-error').textContent = '';
+      try {
+        const res = await remoteRequest('/api/login', el('admin-password').value.trim(),
+          {method:'POST', signal:AbortSignal.timeout(12000)});
+        if (res.status === 401) throw Error('管理口令不正确。');
+        if (!res.ok) throw Error();
+        const data = await res.json();
+        if (typeof data.session !== 'string' || !data.session) throw Error();
+        adminSession = data.session;
+        el('admin-password').value = '';
+        el('admin-login').hidden = true;
+        el('monitor').hidden = false;
+        el('logout').hidden = false;
+        document.body.classList.remove('signed-out');
+        el('cloud-message').textContent = '正在读取设备…';
+        await refreshCloud();
+      } catch (error) {
+        el('login-error').textContent = error.message === '管理口令不正确。' ? error.message :
+          '连接不到管理服务。请确认管理电脑已联网，网页服务和隧道已启动。';
+      } finally { el('login-submit').disabled = false; }
+    });
+    el('logout').addEventListener('click', async () => {
+      const token = adminSession;
+      adminSession = '';
+      el('monitor').hidden = true;
+      try {
+        await remoteRequest('/api/logout', token, {method:'POST', signal:AbortSignal.timeout(3000)});
+      } finally { window.location.reload(); }
+    });
     const grid = el('batteries'), dialog = el('alarm-dialog'), formDialog = el('device-dialog');
     let selectedAlarmId = null, toRemove = null;
     const indicatorBusy = new Set();
@@ -352,7 +424,7 @@
           data.name=f.name; data.binary=await encodeBin(f);
         }
         ++epoch;
-        const response=await window.fetch('/api/firmware',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(30000)});
+        const response=await apiFetch('/api/firmware',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:AbortSignal.timeout(30000)});
         const result=await response.json();
         if(!response.ok) throw Error(result.error || '提交失败。');
         ++epoch; applyView(result);
@@ -547,7 +619,7 @@
     async function mutate(path,body,errorId,buttonId) {
       const b=el(buttonId); b.disabled=true; el(errorId).textContent=''; ++epoch;
       try {
-        const r=await window.fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(7000)});
+        const r=await apiFetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(7000)});
         const data=await r.json(); if(!r.ok) throw Error(data.error || '保存失败。');
         ++epoch; applyView(data); return true;
       } catch(e) { el(errorId).textContent=e.message; return false; }
@@ -603,17 +675,16 @@
       if(el('fw-dialog').open) renderFirmware();
     }
     async function refreshCloud(){
-      if(pending) return;
+      if(pending || !adminSession) return;
       pending=true; const request=epoch;
       try{
-        const r=await window.fetch('/api/devices',{cache:'no-store',signal:AbortSignal.timeout(7000)});
-        if(r.status===404 && window.location?.port==='8766') { window.location.replace('http://127.0.0.1:8767/'); return; }
+        const r=await apiFetch('/api/devices',{cache:'no-store',signal:AbortSignal.timeout(7000)});
         if(!r.ok) throw Error();
         const data=await r.json(); if(request===epoch) applyView(data);
       }catch{
         if(request===epoch){
           checkedAt=Date.now(); renderDashboard(); el('cloud-status').className='snapshot failed';
-          el('cloud-message').textContent=loaded?'本机服务未连接 · 保留上次读数':'本机服务未连接 · 请启动网页服务';
+          el('cloud-message').textContent=loaded?'管理服务未连接 · 保留上次读数':'暂时无法读取设备 · 正在重试';
         }
       }finally{pending=false;}
     }
